@@ -1,10 +1,13 @@
+
 import os
 import datetime as dt
 import pandas as pd
 import yfinance as yf
-from dotenv import load_dotenv
-
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv n'est pas disponible, on continue sans charger .env
 
 try:
     from polygon import RESTClient

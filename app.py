@@ -173,74 +173,97 @@ if run:
             st.stop()
         else:
             valid_tickers = valid["Ticker"].tolist()
-            chosen = st.selectbox("Sélection action", valid_tickers, key="ov_chosen")
-            row = valid[valid["Ticker"] == chosen].iloc[0]
+            # Affichage horizontal des métriques principales pour chaque action
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Score", f"{row['Score']:.1f}")
-            c2.metric("Return (ann.)", f"{row['Annual Return']:.2%}" if pd.notna(row["Annual Return"]) else "NA")
-            c3.metric("Vol (ann.)", f"{row['Annual Volatility']:.2%}" if pd.notna(row["Annual Volatility"]) else "NA")
-            c4.metric("Drawdown max", f"{row['Max Drawdown']:.2%}" if pd.notna(row["Max Drawdown"]) else "NA")
 
-            c5, c6 = st.columns(2)
-            c5.metric("Beta", f"{row['Beta']:.2f}" if pd.notna(row["Beta"]) else "NA")
-            c6.metric("Alpha (ann.)", f"{row['Alpha']:.2%}" if pd.notna(row["Alpha"]) else "NA")
 
-            if chosen in prices:
-                close = prices[chosen]["Close"].dropna()
-                st.write("Prix (Close)")
-                st.line_chart(close)
+            # Calcul et affichage des métriques agrégées du portefeuille (overview général)
+            close_df = safe_close_df(prices)
+            if close_df.shape[1] >= 2:
+                returns_df = close_df.pct_change().dropna()
+                mu = returns_df.mean().values * 252
+                cov = returns_df.cov().values * 252
+                try:
+                    bounds = [(min_w, max_w)] * len(mu)
+                    w = max_sharpe(mu, cov, rf=rf, bounds=bounds)
+                except Exception:
+                    w = np.ones(len(mu)) / len(mu)
+                port_return = np.dot(w, mu)
+                port_vol = np.sqrt(np.dot(w.T, np.dot(cov, w)))
+                port_close = (close_df * w).sum(axis=1)
+                port_drawdown = drawdown(port_close).min()
+                # Beta/Alpha vs benchmark principal
+                from data_provider import get_prices
+                bench1 = get_prices(bench_us, period, interval)["Close"].dropna()
+                port_beta, port_alpha = np.nan, np.nan
+                try:
+                    roll = rolling_beta_alpha(port_close, bench1, window=60, rf=rf)
+                    port_beta = roll["Beta (rolling)"].iloc[-1]
+                    port_alpha = roll["Alpha (rolling, ann.)"].iloc[-1]
+                except Exception:
+                    pass
+                port_sharpe = (port_return - rf) / port_vol if port_vol > 0 else 0
+                c1, c2, c3, c4, c5, c6 = st.columns(6)
+                c1.metric("Score (Sharpe)", f"{port_sharpe:.2f}")
+                c2.metric("Alpha (ann.)", f"{port_alpha:.2%}" if not np.isnan(port_alpha) else "NA")
+                c3.metric("Beta", f"{port_beta:.2f}" if not np.isnan(port_beta) else "NA")
+                c4.metric("Return (ann.)", f"{port_return:.2%}")
+                c5.metric("Vol (ann.)", f"{port_vol:.2%}")
+                c6.metric("Drawdown max", f"{port_drawdown:.2%}")
 
-                st.write("Performance cumulée")
-                st.line_chart(cum_performance(close))
+            # Afficher un seul graphique global des prix (Close/Adj Close) pour toutes les actions
+            st.subheader("Prices (Close/Adj Close)")
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(figsize=(7, 5))
+            for ticker in valid_tickers:
+                if ticker in prices and not prices[ticker].empty:
+                    close = prices[ticker]["Close"].dropna()
+                    ax.plot(close.index, close.values, label=ticker)
+            ax.set_title("Prices (Close/Adj Close)")
+            ax.set_ylabel("Price")
+            ax.legend()
+            st.pyplot(fig)
 
-                st.write("Drawdown")
-                st.line_chart(drawdown(close))
+
 
     # -----------------------------
     # TAB 2: Compare Markets
     # -----------------------------
     with tab2:
-        st.subheader("Comparaison au marché (SPY / QQQ / etc.)")
+        st.subheader("Comparaison portefeuille vs benchmarks (SPY / QQQ / etc.)")
 
-        valid = results[(results["Score"].notna()) & (~results["Error"].notna() if "Error" in results.columns else True)]
-        if valid.empty:
-            st.warning("Pas de données action.")
-            st.stop()
+        # Utilise le backtest du portefeuille (tab4) et compare aux benchmarks
+        close_df = safe_close_df(prices)
+        if close_df.empty or close_df.shape[1] < 2:
+            st.warning("Il faut au moins 2 actions valides pour comparer au marché.")
         else:
-            valid_tickers = valid["Ticker"].tolist()
-            chosen = st.selectbox("Action à comparer", valid_tickers, key="cmp_chosen")
+            # Backtest portefeuille
+            bt = monthly_rebalance(close_df, rf=rf, min_w=min_w, max_w=max_w)
+            portfolio_equity = bt["Portfolio"]
 
-            # get action close
-            if chosen not in prices:
-                st.warning("Données action non dispo.")
-            else:
-                asset_close = prices[chosen]["Close"].dropna()
+            # Benchmarks
+            from data_provider import get_prices
+            bench1 = get_prices(bench_us, period, interval)["Close"].dropna()
+            bench2 = get_prices(bench_alt, period, interval)["Close"].dropna()
 
-                # Fetch benchmarks via analyze's prices? (Not in cache) -> easiest: reuse data_provider
-                from data_provider import get_prices
+            # Normalise equity (start=1)
+            portfolio_norm = portfolio_equity / portfolio_equity.iloc[0]
+            bench1_norm = bench1 / bench1.iloc[0]
+            bench2_norm = bench2 / bench2.iloc[0]
 
-                bench1 = get_prices(bench_us, period, interval)["Close"].dropna()
-                bench2 = get_prices(bench_alt, period, interval)["Close"].dropna()
+            # Align dates
+            df = pd.concat({
+                "Portfolio": portfolio_norm,
+                bench_us: bench1_norm,
+                bench_alt: bench2_norm
+            }, axis=1).dropna()
 
-                # Align by dates
-                df = pd.concat({
-                    chosen: asset_close,
-                    bench_us: bench1,
-                    bench_alt: bench2
-                }, axis=1).dropna()
+            st.write("Backtest (Portfolio vs Benchmarks)")
+            st.line_chart(df)
 
-                st.write("Performance cumulée (normalisée)")
-                perf = df.apply(cum_performance)
-                st.line_chart(perf)
-
-                st.write("Corrélations (sur la période)")
-                rets = df.pct_change().dropna()
-                st.dataframe(rets.corr(), use_container_width=True)
-
-                st.write("Beta & Alpha rolling (60 jours) vs benchmark principal")
-                roll = rolling_beta_alpha(df[chosen], df[bench_us], window=60, rf=rf)
-                st.line_chart(roll)
+            st.write("Corrélations (sur la période)")
+            rets = df.pct_change().dropna()
+            st.dataframe(rets.corr(), use_container_width=True)
 
     # -----------------------------
     # TAB 3: Risk
