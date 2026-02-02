@@ -1,6 +1,9 @@
+
 import streamlit as st
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+from io import BytesIO
 
 from analysis import analyze
 from optimizer import max_sharpe
@@ -25,12 +28,25 @@ with st.sidebar:
 
     budget = st.number_input("Budget (€)", 100.0, 1e7, 1000.0, step=100.0)
 
+
     st.divider()
     rf = st.number_input("Risk-free rate (annuel, ex 0.03)", 0.0, 0.2, 0.0, step=0.01)
     target = st.number_input("Objectif rendement annuel (%)", 0.0, 100.0, 10.0) / 100
     risk = st.slider("Tolérance au risque (1 faible → 10 élevé)", 1, 10, 5)
     max_vol = {1:0.15,2:0.18,3:0.20,4:0.23,5:0.26,6:0.30,7:0.35,8:0.40,9:0.45,10:0.55}[risk]
     st.caption(f"Vol max (scoring) ~ {int(max_vol*100)}%")
+
+    # New: User-adjustable volatility (%)
+    user_vol = st.number_input("Volatility (%)", 0.0, 100.0, float(int(max_vol*100)), step=0.1) / 100
+
+    # New: CML risk-free asset
+    cml_rf = st.number_input("CML Risk-Free Asset (annuel, %)", 0.0, 20.0, float(int(rf*100)), step=0.1) / 100
+
+    # New: Investment horizon
+    st.divider()
+    st.subheader("Investment Gain Calculator")
+    invest_years = st.number_input("Number of years to invest", 1, 100, 10)
+    annual_return_input = st.number_input("Expected annual return (%)", 0.0, 100.0, float(int(target*100)), step=0.1) / 100
 
     st.divider()
     st.subheader("Benchmarks")
@@ -98,23 +114,43 @@ def rolling_beta_alpha(asset_close: pd.Series, bench_close: pd.Series, window=60
 # Main
 # -----------------------------
 if run:
+
+
     tickers = [t.strip().upper() for t in tickers if t.strip()]
     if not tickers:
         st.error("Ajoute au moins un ticker.")
         st.stop()
 
-    with st.spinner("Calcul en cours (prix, score, beta/alpha, VaR/CVaR)..."):
-        results, prices = analyze(
-            tickers=tickers,
-            period=period,
-            interval=interval,
-            rf=rf,
-            target=target,
-            max_vol=max_vol,
-            bench_us=bench_us,
-            bench_eu=bench_eu,
-            var_level=var_level
-        )
+    try:
+        with st.spinner("Calcul en cours (prix, score, beta/alpha, VaR/CVaR)..."):
+            results, prices = analyze(
+                tickers=tickers,
+                period=period,
+                interval=interval,
+                rf=rf,
+                target=target,
+                max_vol=user_vol,  # Use user-adjustable volatility
+                bench_us=bench_us,
+                bench_eu=bench_eu,
+                var_level=var_level
+            )
+    except Exception as e:
+        st.error(f"Erreur lors de l'analyse : {e}")
+        st.stop()
+
+    # Affiche les erreurs de tickers individuellement dans le tableau
+    if "Error" in results.columns and results["Error"].notna().any():
+        error_tickers = results[results["Error"].notna()][["Ticker", "Error"]]
+        for _, row in error_tickers.iterrows():
+            st.warning(f"Erreur pour {row['Ticker']} : {row['Error']}")
+
+    # --- Investment Gain Calculation ---
+    st.subheader("📈 Investment Gain Result")
+    if annual_return_input > 0 and invest_years > 0:
+        final_gain = budget * ((1 + annual_return_input) ** invest_years)
+        st.success(f"After {invest_years} years, with an annual return of {annual_return_input*100:.2f}%, your investment grows from €{budget:,.2f} to €{final_gain:,.2f}.")
+    else:
+        st.info("Set a positive annual return and years to see the result.")
 
     # Ensure columns exist
     for col in ["Last Price", "Annual Return", "Annual Volatility", "Sharpe", "Max Drawdown", "VaR", "CVaR", "Beta", "Alpha", "Score"]:
@@ -130,12 +166,15 @@ if run:
         st.subheader("Tableau complet (métriques + score + beta/alpha)")
         st.dataframe(results.sort_values("Score", ascending=False, na_position="last"), use_container_width=True)
 
-        valid = results.dropna(subset=["Score"])
+        # Exclure les tickers en erreur de la sélection et des graphiques
+        valid = results[(results["Score"].notna()) & (~results["Error"].notna() if "Error" in results.columns else True)]
         if valid.empty:
             st.warning("Aucune action exploitable (vérifie tickers/API).")
+            st.stop()
         else:
-            chosen = st.selectbox("Sélection action", valid["Ticker"].tolist(), key="ov_chosen")
-            row = results[results["Ticker"] == chosen].iloc[0]
+            valid_tickers = valid["Ticker"].tolist()
+            chosen = st.selectbox("Sélection action", valid_tickers, key="ov_chosen")
+            row = valid[valid["Ticker"] == chosen].iloc[0]
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Score", f"{row['Score']:.1f}")
@@ -164,11 +203,13 @@ if run:
     with tab2:
         st.subheader("Comparaison au marché (SPY / QQQ / etc.)")
 
-        valid = results.dropna(subset=["Score"])
+        valid = results[(results["Score"].notna()) & (~results["Error"].notna() if "Error" in results.columns else True)]
         if valid.empty:
             st.warning("Pas de données action.")
+            st.stop()
         else:
-            chosen = st.selectbox("Action à comparer", valid["Ticker"].tolist(), key="cmp_chosen")
+            valid_tickers = valid["Ticker"].tolist()
+            chosen = st.selectbox("Action à comparer", valid_tickers, key="cmp_chosen")
 
             # get action close
             if chosen not in prices:
@@ -207,12 +248,14 @@ if run:
     with tab3:
         st.subheader("Risk (VaR/CVaR + distribution + stress test)")
 
-        valid = results.dropna(subset=["Score"])
+        valid = results[(results["Score"].notna()) & (~results["Error"].notna() if "Error" in results.columns else True)]
         if valid.empty:
             st.warning("Pas de données exploitables.")
+            st.stop()
         else:
-            chosen = st.selectbox("Action (Risk)", valid["Ticker"].tolist(), key="risk_chosen")
-            row = results[results["Ticker"] == chosen].iloc[0]
+            valid_tickers = valid["Ticker"].tolist()
+            chosen = st.selectbox("Action (Risk)", valid_tickers, key="risk_chosen")
+            row = valid[valid["Ticker"] == chosen].iloc[0]
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Volatilité (ann.)", f"{row['Annual Volatility']:.2%}" if pd.notna(row["Annual Volatility"]) else "NA")
@@ -275,3 +318,46 @@ if run:
             bt = monthly_rebalance(close_df, rf=rf, min_w=min_w, max_w=max_w)
             st.line_chart(bt["Portfolio"])
             st.line_chart(bt["Drawdown"])
+
+            # --- Efficient Frontier & CML Plot ---
+            st.write("Efficient Frontier + CML")
+            n_portfolios = 2000
+            np.random.seed(42)
+            n_assets = len(mu)
+            results = np.zeros((n_portfolios, 3))  # vol, ret, sharpe
+            weights_record = []
+            for i in range(n_portfolios):
+                weights = np.random.dirichlet(np.ones(n_assets), 1).flatten()
+                port_return = np.dot(weights, mu)
+                port_vol = np.sqrt(np.dot(weights.T, np.dot(cov, weights)))
+                port_sharpe = (port_return - cml_rf) / port_vol if port_vol > 0 else 0
+                results[i, 0] = port_vol
+                results[i, 1] = port_return
+                results[i, 2] = port_sharpe
+                weights_record.append(weights)
+
+            max_sharpe_idx = np.argmax(results[:, 2])
+            min_vol_idx = np.argmin(results[:, 0])
+
+            # CML line
+            tangency_vol = results[max_sharpe_idx, 0]
+            tangency_ret = results[max_sharpe_idx, 1]
+            cml_x = np.linspace(0, results[:, 0].max(), 100)
+            cml_y = cml_rf + (tangency_ret - cml_rf) / tangency_vol * cml_x
+
+            fig, ax = plt.subplots(figsize=(7, 5))
+            sc = ax.scatter(results[:, 0], results[:, 1], c=results[:, 2], cmap='viridis', label='Risky portfolios')
+            ax.scatter(results[min_vol_idx, 0], results[min_vol_idx, 1], color='cyan', marker='o', s=100, label='Min Variance')
+            ax.scatter(results[max_sharpe_idx, 0], results[max_sharpe_idx, 1], color='red', marker='*', s=150, label='Max Sharpe (Tangency)')
+            ax.plot(cml_x, cml_y, color='deepskyblue', linewidth=2, label='CML (Rf → Tangency)')
+            ax.set_xlabel('Annualized Volatility')
+            ax.set_ylabel('Annualized Return')
+            ax.set_title('Frontier (risky-only) + CML')
+            fig.colorbar(sc, ax=ax, label='Sharpe Ratio')
+            ax.legend()
+            plt.tight_layout()
+
+            buf = BytesIO()
+            plt.savefig(buf, format="png")
+            st.image(buf.getvalue(), caption="Efficient Frontier + CML", use_column_width=True)
+            plt.close(fig)
